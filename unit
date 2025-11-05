@@ -1,0 +1,166 @@
+unit MagnetUI;
+
+{$mode objfpc}{$H+}
+
+interface
+
+uses
+  Classes, SysUtils, Forms, Controls, Graphics, Dialogs, StdCtrls, ExtCtrls,
+  LazSerial;
+
+type
+  { TForm1 }
+  TForm1 = class(TForm)
+    BtnOpen: TButton;
+    BtnClose: TButton;
+    BtnEnable: TButton;
+    BtnDisable: TButton;
+    BtnSetpoint: TButton;
+    BtnRampStart: TButton;
+    BtnRampStop: TButton;
+    BtnModOn: TButton;
+    BtnModOff: TButton;
+    BtnQuery: TButton;
+    BtnEStop: TButton;
+    EditPort: TEdit;
+    EditBaud: TEdit;
+    EditSetpoint: TEdit;
+    EditRampRate: TEdit;
+    EditModFreq: TEdit;
+    EditModAmp: TEdit;
+    MemoLog: TMemo;
+    Label1: TLabel; Label2: TLabel; Label3: TLabel; Label4: TLabel;
+    Label5: TLabel; Label6: TLabel;
+    TimerPoll: TTimer;
+    Serial: TLazSerial;
+    procedure BtnOpenClick(Sender: TObject);
+    procedure BtnCloseClick(Sender: TObject);
+    procedure BtnEnableClick(Sender: TObject);
+    procedure BtnDisableClick(Sender: TObject);
+    procedure BtnSetpointClick(Sender: TObject);
+    procedure BtnRampStartClick(Sender: TObject);
+    procedure BtnRampStopClick(Sender: TObject);
+    procedure BtnModOnClick(Sender: TObject);
+    procedure BtnModOffClick(Sender: TObject);
+    procedure BtnQueryClick(Sender: TObject);
+    procedure BtnEStopClick(Sender: TObject);
+    procedure FormCreate(Sender: TObject);
+    procedure SerialRxData(Sender: TObject);
+    procedure TimerPollTimer(Sender: TObject);
+  private
+    procedure SendCmd(const S: string);
+    procedure Log(const S: string);
+  public
+  end;
+
+var
+  Form1: TForm1;
+
+implementation
+
+{$R *.lfm}
+
+{ TForm1 }
+
+procedure TForm1.FormCreate(Sender: TObject);
+begin
+  EditPort.Text := 'COM6';      // e.g. Windows; on Linux: /dev/ttyACM0
+  EditBaud.Text := '115200';
+  EditSetpoint.Text := '0.000';  // engineering units: A or V
+  EditRampRate.Text := '0.100';  // units/s
+  EditModFreq.Text := '23.0';    // Hz
+  EditModAmp.Text := '0.010';    // units peak
+  TimerPoll.Enabled := False;
+end;
+
+procedure TForm1.Log(const S: string);
+begin
+  MemoLog.Lines.Add(FormatDateTime('hh:nn:ss.zzz', Now) + '  ' + S);
+end;
+
+procedure TForm1.SendCmd(const S: string);
+var outStr: string;
+begin
+  outStr := S + #13#10;            // CRLF line end
+  Serial.WriteData(outStr);
+  Log('TX: ' + S);
+end;
+
+procedure TForm1.SerialRxData(Sender: TObject);
+var s:string;
+begin
+  s := Serial.ReadData;
+  if s<>'' then Log('RX: ' + Trim(s));
+end;
+
+procedure TForm1.BtnOpenClick(Sender: TObject);
+begin
+  Serial.Device := EditPort.Text;
+  Serial.BaudRate := StrToIntDef(EditBaud.Text, 115200);
+  Serial.DataBits := db8bits;
+  Serial.StopBits := sbOne;
+  Serial.Parity := pNone;
+  Serial.Active := True;
+  Log('Port opened');
+  TimerPoll.Enabled := True;
+end;
+
+procedure TForm1.BtnCloseClick(Sender: TObject);
+begin
+  TimerPoll.Enabled := False;
+  Serial.Active := False;
+  Log('Port closed');
+end;
+
+procedure TForm1.BtnEnableClick(Sender: TObject);
+begin
+  SendCmd('BO 1');
+end;
+
+procedure TForm1.BtnDisableClick(Sender: TObject);
+begin
+  SendCmd('BO 0');
+end;
+
+procedure TForm1.BtnSetpointClick(Sender: TObject);
+begin
+  SendCmd('BM ' + Trim(EditSetpoint.Text));
+end;
+
+procedure TForm1.BtnRampStartClick(Sender: TObject);
+begin
+  SendCmd('BR ' + Trim(EditRampRate.Text));
+  SendCmd('BS START');
+end;
+
+procedure TForm1.BtnRampStopClick(Sender: TObject);
+begin
+  SendCmd('BS STOP');
+end;
+
+procedure TForm1.BtnModOnClick(Sender: TObject);
+begin
+  SendCmd('BF ' + Trim(EditModFreq.Text) + ' ' + Trim(EditModAmp.Text));
+end;
+
+procedure TForm1.BtnModOffClick(Sender: TObject);
+begin
+  SendCmd('BF OFF');
+end;
+
+procedure TForm1.BtnQueryClick(Sender: TObject);
+begin
+  SendCmd('Q?');
+end;
+
+procedure TForm1.BtnEStopClick(Sender: TObject);
+begin
+  SendCmd('ESTOP');
+end;
+
+procedure TForm1.TimerPollTimer(Sender: TObject);
+begin
+  SendCmd('Q?');
+end;
+
+end.
