@@ -1,0 +1,9 @@
+BM <value>        ; set B-field setpoint (engineering units, e.g., amperes)
+BR <rate>         ; set ramp slew rate (units per second), positive number
+BS START          ; begin ramping toward current BM target
+BS STOP           ; stop ramp (hold current DAC)
+BF <freq> <amp>   ; enable LF modulation (Hz, peak amplitude in same units as BM)
+BF OFF            ; disable LF modulation
+BO 0/1            ; output enable (1) / disable (0) to the DAC for magnet
+Q?                ; query: returns a status line (see below)
+ESTOP             ; immediate output disable + zero setpoint
