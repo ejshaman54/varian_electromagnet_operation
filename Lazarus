@@ -1,0 +1,261 @@
+program MagnetUI;
+
+{$mode objfpc}{$H+}
+
+uses
+  {$IFDEF UNIX}{$IFDEF UseCThreads}
+  cthreads,
+  {$ENDIF}{$ENDIF}
+  // *** The next unit is REQUIRED for GUI ***
+  Interfaces, // LCL widgetset MUST be first in uses for GUI apps
+  Forms, StdCtrls, ExtCtrls, Classes, SysUtils
+  {$IFDEF HasLazSerial}, LazSerial{$ENDIF}
+  ;
+
+type
+  { TMainForm }
+  TMainForm = class(TForm)
+  private
+    // UI elements
+    BtnOpen, BtnClose, BtnEnable, BtnDisable,
+    BtnSetpoint, BtnRampStart, BtnRampStop,
+    BtnModOn, BtnModOff, BtnQuery, BtnEStop,
+    BtnDegauss: TButton;
+    EditPort, EditBaud, EditSetpoint, EditRampRate,
+    EditModFreq, EditModAmp: TEdit;
+    LPort, LBaud, LSet, LRamp, LModF, LModA: TLabel;
+    MemoLog: TMemo;
+    TimerPoll: TTimer;
+    WarnLbl: TLabel;
+
+    {$IFDEF HasLazSerial}
+    Serial: TLazSerial;
+    {$ENDIF}
+
+    procedure Log(const S: string);
+    procedure SendCmd(const S: string);
+
+    // Event handlers
+    procedure OnOpen(Sender: TObject);
+    procedure OnClose(Sender: TObject);
+    procedure OnEnable(Sender: TObject);
+    procedure OnDisable(Sender: TObject);
+    procedure OnSetpoint(Sender: TObject);
+    procedure OnRampStart(Sender: TObject);
+    procedure OnRampStop(Sender: TObject);
+    procedure OnModOn(Sender: TObject);
+    procedure OnModOff(Sender: TObject);
+    procedure OnQuery(Sender: TObject);
+    procedure OnEStop(Sender: TObject);
+    procedure OnDegauss(Sender: TObject);
+    procedure OnPoll(Sender: TObject);
+    {$IFDEF HasLazSerial}
+    procedure OnRxData(Sender: TObject);
+    {$ENDIF}
+
+    procedure BuildUI;
+  public
+    constructor Create(AOwner: TComponent); override;
+  end;
+
+{ TMainForm }
+
+constructor TMainForm.Create(AOwner: TComponent);
+begin
+  inherited Create(AOwner);
+  Caption := 'Varian Magnet Control (MCU link)';
+  Width := 880; Height := 600;
+  Position := poScreenCenter;
+  BuildUI;
+end;
+
+procedure TMainForm.BuildUI;
+var topY: Integer;
+
+  function MkLabel(const Cap: string; X, Y: Integer): TLabel;
+  begin
+    Result := TLabel.Create(Self);
+    Result.Parent := Self;
+    Result.Left := X; Result.Top := Y; Result.Caption := Cap;
+  end;
+
+  function MkEdit(Default: string; X, Y, W: Integer): TEdit;
+  begin
+    Result := TEdit.Create(Self);
+    Result.Parent := Self;
+    Result.Left := X; Result.Top := Y; Result.Width := W;
+    Result.Text := Default;
+  end;
+
+  function MkBtn(const Cap: string; X, Y, W: Integer; OnClick: TNotifyEvent): TButton;
+  begin
+    Result := TButton.Create(Self);
+    Result.Parent := Self;
+    Result.Left := X; Result.Top := Y; Result.Width := W; Result.Caption := Cap;
+    Result.OnClick := OnClick;
+  end;
+
+begin
+  topY := 12;
+
+  // Port & baud
+  LPort := MkLabel('Port', 12, topY+4);
+  EditPort := MkEdit({Windows} 'COM6', {Linux '/dev/ttyACM0'} 70, topY, 120);
+  LBaud := MkLabel('Baud', 210, topY+4);
+  EditBaud := MkEdit('115200', 260, topY, 80);
+  BtnOpen := MkBtn('Open', 360, topY-2, 70, @OnOpen);
+  BtnClose := MkBtn('Close', 440, topY-2, 70, @OnClose);
+
+  // Setpoint / Ramp / Mod
+  topY += 36;
+  LSet := MkLabel('Setpoint (A)', 12, topY+4);
+  EditSetpoint := MkEdit('0.000', 120, topY, 80);
+  BtnSetpoint := MkBtn('Apply', 210, topY-2, 60, @OnSetpoint);
+  BtnEnable := MkBtn('Enable Out', 280, topY-2, 100, @OnEnable);
+  BtnDisable := MkBtn('Disable Out', 390, topY-2, 100, @OnDisable);
+  BtnEStop := MkBtn('ESTOP', 500, topY-2, 80, @OnEStop);
+
+  topY += 36;
+  LRamp := MkLabel('Ramp (A/s)', 12, topY+4);
+  EditRampRate := MkEdit('0.100', 120, topY, 80);
+  BtnRampStart := MkBtn('Ramp START', 210, topY-2, 120, @OnRampStart);
+  BtnRampStop  := MkBtn('Ramp STOP', 340, topY-2, 120, @OnRampStop);
+  BtnDegauss   := MkBtn('Degauss', 470, topY-2, 90, @OnDegauss);
+
+  topY += 36;
+  LModF := MkLabel('Mod f (Hz)', 12, topY+4);
+  EditModFreq := MkEdit('23.0', 120, topY, 80);
+  LModA := MkLabel('Mod Amp (A pk)', 210, topY+4);
+  EditModAmp := MkEdit('0.010', 330, topY, 80);
+  BtnModOn := MkBtn('Mod ON', 420, topY-2, 80, @OnModOn);
+  BtnModOff := MkBtn('Mod OFF', 510, topY-2, 80, @OnModOff);
+  BtnQuery := MkBtn('Query', 600, topY-2, 80, @OnQuery);
+
+  // Log box
+  MemoLog := TMemo.Create(Self);
+  MemoLog.Parent := Self;
+  MemoLog.Left := 12; MemoLog.Top := topY + 40;
+  MemoLog.Width := ClientWidth - 24; MemoLog.Height := ClientHeight - MemoLog.Top - 24;
+  MemoLog.Anchors := [akLeft, akTop, akRight, akBottom];
+
+  // Poll timer
+  TimerPoll := TTimer.Create(Self);
+  TimerPoll.Interval := 1000; // ms
+  TimerPoll.OnTimer := @OnPoll;
+  TimerPoll.Enabled := False;
+
+  // Serial (optional)
+  {$IFDEF HasLazSerial}
+  Serial := TLazSerial.Create(Self);
+  Serial.BaudRate := 115200;
+  Serial.DataBits := db8bits;
+  Serial.StopBits := sbOne;
+  Serial.Parity := pNone;
+  Serial.OnRxData := @OnRxData;
+  {$ELSE}
+  WarnLbl := TLabel.Create(Self);
+  WarnLbl.Parent := Self;
+  WarnLbl.Left := 700; WarnLbl.Top := 12;
+  WarnLbl.Font.Color := clRed;
+  WarnLbl.Caption := 'Serial disabled (install LazSerial)';
+  {$ENDIF}
+end;
+
+procedure TMainForm.Log(const S: string);
+begin
+  MemoLog.Lines.Add(FormatDateTime('hh:nn:ss.zzz', Now) + '  ' + S);
+end;
+
+procedure TMainForm.SendCmd(const S: string);
+{$IFDEF HasLazSerial}
+begin
+  if (Serial<>nil) and Serial.Active then
+  begin
+    Serial.WriteData(S + #13#10);
+    Log('TX: ' + S);
+  end
+  else
+    Log('TX FAILED (port closed): ' + S);
+end;
+{$ELSE}
+begin
+  Log('NO SERIAL: ' + S);
+end;
+{$ENDIF}
+
+{$IFDEF HasLazSerial}
+procedure TMainForm.OnRxData(Sender: TObject);
+var s:string;
+begin
+  s := Serial.ReadData;
+  if s<>'' then Log('RX: ' + Trim(s));
+end;
+{$ENDIF}
+
+procedure TMainForm.OnOpen(Sender: TObject);
+begin
+  {$IFDEF HasLazSerial}
+  Serial.Device := EditPort.Text;
+  Serial.BaudRate := StrToIntDef(EditBaud.Text, 115200);
+  Serial.Active := True;
+  Log('Port opened: ' + Serial.Device);
+  TimerPoll.Enabled := True;
+  {$ELSE}
+  Log('Cannot open: LazSerial not installed.');
+  {$ENDIF}
+end;
+
+procedure TMainForm.OnClose(Sender: TObject);
+begin
+  TimerPoll.Enabled := False;
+  {$IFDEF HasLazSerial}
+  Serial.Active := False;
+  Log('Port closed');
+  {$ELSE}
+  Log('Port closed (noop)');
+  {$ENDIF}
+end;
+
+procedure TMainForm.OnEnable(Sender: TObject);
+begin SendCmd('BO 1'); end;
+
+procedure TMainForm.OnDisable(Sender: TObject);
+begin SendCmd('BO 0'); end;
+
+procedure TMainForm.OnSetpoint(Sender: TObject);
+begin SendCmd('BM ' + Trim(EditSetpoint.Text)); end;
+
+procedure TMainForm.OnRampStart(Sender: TObject);
+begin
+  SendCmd('BR ' + Trim(EditRampRate.Text));
+  SendCmd('BS START');
+end;
+
+procedure TMainForm.OnRampStop(Sender: TObject);
+begin SendCmd('BS STOP'); end;
+
+procedure TMainForm.OnModOn(Sender: TObject);
+begin SendCmd('BF ' + Trim(EditModFreq.Text) + ' ' + Trim(EditModAmp.Text)); end;
+
+procedure TMainForm.OnModOff(Sender: TObject);
+begin SendCmd('BF OFF'); end;
+
+procedure TMainForm.OnQuery(Sender: TObject);
+begin SendCmd('Q?'); end;
+
+procedure TMainForm.OnEStop(Sender: TObject);
+begin SendCmd('ESTOP'); end;
+
+procedure TMainForm.OnDegauss(Sender: TObject);
+begin SendCmd('DG 0.8 1.0 10.0'); end; // 80% Imax, 1 Hz, 10 s
+procedure TMainForm.OnPoll(Sender: TObject);
+begin SendCmd('Q?'); end;
+
+var
+  Form: TMainForm;
+
+begin
+  Application.Initialize;
+  Application.CreateForm(TMainForm, Form);
+  Application.Run;
+end.
