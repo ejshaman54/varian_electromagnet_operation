@@ -1,0 +1,28 @@
+// New controls (declare on form): EditVperA, CheckInvert, EditIMax, EditL, EditR, EditGperA, BtnDegauss
+
+procedure TForm1.BtnDegaussClick(Sender: TObject);
+begin
+  // amplitude: 80% of Imax, 1.0 Hz, 10 s decay
+  SendCmd('DG 0.8 1.0 10.0');
+end;
+
+procedure TForm1.BtnRampStartClick(Sender: TObject);
+var Lh, Rm, Vprog, Imax, di_dt, safe_rate: Double;
+begin
+  // Suggest a safe ramp from L,R and available program voltage
+  // Voltage available at coil is approx supply compliance; be conservative and use program range.
+  Lh   := StrToFloatDef(EditL.Text,   0.5);  // Henries
+  Rm   := StrToFloatDef(EditR.Text,   2.0);  // Ohms
+  Imax := StrToFloatDef(EditIMax.Text,10.0); // A
+  // Suppose analog program range is ±10V and supply is 1 V/A -> 10 A; use 80% margin
+  Vprog := 8.0; // Volts effective
+  // di/dt ≈ (Vprog - I*R)/L; worst case at I≈0 ⇒ di/dt ≈ Vprog/L
+  safe_rate := Vprog / Lh; // A/s
+  di_dt := Min(safe_rate, StrToFloatDef(EditRampRate.Text, 0.1));
+
+  SendCmd(Format('CFG SCALE %.6f INVERT %d IMAX %.3f GPERA %.6f',
+                  [StrToFloatDef(EditVperA.Text,1.0), Ord(CheckInvert.Checked),
+                   Imax, StrToFloatDef(EditGperA.Text,0.0)]));
+  SendCmd(Format('BR %.6f', [di_dt]));
+  SendCmd('BS START');
+end;
