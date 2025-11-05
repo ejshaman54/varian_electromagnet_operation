@@ -1,0 +1,132 @@
+// ===== Varian Electromagnet Controls (additions) =====
+static volatile float V_per_A = 1.0f;   // supply program input scaling [V/A]
+static volatile int   invert   = 0;     // 0 normal, 1 invert polarity at DAC
+static volatile float I_max    = 10.0f; // absolute |I| limit
+static volatile float G_per_A  = 0.0f;  // optional field scale [Gauss/A]
+
+// Degauss state
+static volatile bool  dg_enable = false;
+static volatile float dg_amp    = 0.8f;     // as fraction of I_max
+static volatile float dg_freq   = 1.0f;     // Hz
+static volatile float dg_time   = 10.0f;    // seconds total
+static volatile float dg_t      = 0.0f;     // time accumulator
+
+// Optional interlock input (water/overtemp). Implement this:
+static bool Interlock_OK(void) {
+    // TODO: read a GPIO or ADC threshold; return true if safe
+    return true;
+}
+
+// ENGINEERING A -> DAC volts with scaling & invert
+static float A_to_volts(float I)
+{
+    float v = I * V_per_A;
+    if (invert) v = -v;
+    // clip to ±10V span of typical program input
+    if (v > 10.0f) v = 10.0f;
+    if (v < -10.0f) v = -10.0f;
+    return v;
+}
+
+// replace DAC_SetMagnetVolts() call site with A_to_volts(current_command)
+
+void Magnet_CtrlTickISR(void)
+{
+    // hard interlock
+    if (!Interlock_OK()) {
+        MagnetOutputEnable(false);
+        b_target = 0.0f; b_out = 0.0f; mod_enable = false; ramp_enable = false; dg_enable = false;
+    }
+
+    // ramp (A/s)
+    float rate = ramp_rate;
+    if (rate > SLEW_MAX) rate = SLEW_MAX; // final guard
+    float step = rate / CTRL_TICK_HZ;
+
+    // if not ramping, step is large so we jump to target
+    if (!ramp_enable) step = I_max;
+
+    // apply degauss if enabled (overrides normal target)
+    float target_I = b_target;
+    if (dg_enable) {
+        dg_t += 1.0f / CTRL_TICK_HZ;
+        float env = 1.0f - (dg_t / dg_time);
+        if (env < 0.0f) { env = 0.0f; dg_enable = false; }
+        float phase = TWO_PI * dg_freq * dg_t;
+        target_I = (dg_amp * I_max * env) * sinf(phase);
+    }
+
+    // slew b_out toward target_I
+    float diff = target_I - b_out;
+    if (fabsf(diff) <= step) b_out = target_I;
+    else                    b_out += (diff > 0 ? step : -step);
+
+    // LF modulation (small AC on top)
+    float I_cmd = b_out;
+    if (mod_enable) {
+        mod_phase += TWO_PI * (mod_freq / CTRL_TICK_HZ);
+        if (mod_phase > TWO_PI) mod_phase -= TWO_PI;
+        I_cmd += mod_amp * sinf(mod_phase);
+    }
+
+    // hard current limits
+    I_cmd = clampf(I_cmd, -I_max, I_max);
+    if (!out_enable) I_cmd = 0.0f;
+
+    // drive supply program input
+    DAC_SetMagnetVolts( A_to_volts(I_cmd) );
+
+    // read back measured current (or echo if not wired)
+    measured_I = ADC_ReadMagnetCurrent();
+}
+
+// ---------- Command extensions ----------
+// CFG SCALE <VperA> INVERT <0|1> IMAX <Amax> GPERA <gauss_per_A>
+//
+// DG <amp_frac> <freq_Hz> <time_s>   (start degauss)
+// DG OFF                              (stop degauss)
+//
+// All previous commands remain available.
+
+void Magnet_ParseLine(char *line)
+{
+    // ... keep previous handlers ...
+
+    if (strncmp(line, "CFG ", 4)==0) {
+        float sc=0, gp=0; int inv=0; float im=0;
+        // allow partials; parse safe defaults first
+        // Expected: CFG SCALE <vpa> INVERT <0|1> IMAX <imax> GPERA <gpa>
+        int matched = sscanf(line+4, "SCALE %f INVERT %d IMAX %f GPERA %f", &sc, &inv, &im, &gp);
+        if (matched >= 2) {
+            if (isfinite(sc) && sc>0) V_per_A = sc;
+            invert = (inv!=0);
+            if (matched >= 3 && isfinite(im) && im>0) I_max = im;
+            if (matched >= 4 && isfinite(gp) && gp>=0) G_per_A = gp;
+            uart_write("OK\n"); return;
+        }
+        uart_write("ERR BAD\n"); return;
+    }
+
+    if (strncmp(line, "DG ", 3)==0) {
+        if (strcmp(line+3, "OFF")==0) { dg_enable=false; uart_write("OK\n"); return; }
+        float a=0,f=0,t=0;
+        if (sscanf(line+3, "%f %f %f", &a,&f,&t)==3) {
+            if (a<=0||a>1.0||f<=0||f>10.0||t<=0||t>120.0) { uart_write("ERR BAD\n"); return; }
+            dg_amp=a; dg_freq=f; dg_time=t; dg_t=0.0f; dg_enable=true; uart_write("OK\n"); return;
+        }
+        uart_write("ERR BAD\n"); return;
+    }
+
+    if (strcmp(line, "Q?")==0) {
+        char buf[160];
+        float B = (G_per_A>0) ? (G_per_A * b_out) : 0.0f;
+        snprintf(buf, sizeof(buf),
+            "OK I=%.6f A  B=%.3f G  RAMP=%d MOD=%d EN=%d DG=%d SCALE=%.4f INV=%d IMAX=%.2f\r\n",
+            (double)measured_I, (double)B,
+            ramp_enable?1:0, mod_enable?1:0, out_enable?1:0, dg_enable?1:0,
+            (double)V_per_A, invert, (double)I_max);
+        uart_write(buf); return;
+    }
+
+    // ... existing handlers ...
+}
