@@ -1,0 +1,191 @@
+// magnet_ctrl.c  — add to your PIC32 project
+
+#include <xc.h>
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+#include <stdbool.h>
+
+// ======= Config =======
+#define CTRL_TICK_HZ     1000.0f     // control ISR frequency
+#define TWO_PI           6.283185307f
+
+// Limits (engineering units = same units you command, e.g., amperes)
+#define B_MAX            10.0f       // absolute max |setpoint|
+#define SLEW_MAX         1.0f        // max ramp rate (units/s)
+#define MOD_AMP_MAX      1.0f        // max LF modulation amplitude (units)
+#define MOD_FREQ_MAX     200.0f      // max LF modulation freq (Hz)
+
+// ======= State =======
+static volatile float b_target = 0.0f;   // commanded setpoint (no modulation)
+static volatile float b_out    = 0.0f;   // actual output after ramp & mod
+static volatile float ramp_rate = 0.1f;  // units/s
+static volatile bool  ramp_enable = false;
+
+static volatile bool  mod_enable = false;
+static volatile float mod_freq   = 23.0f; // Hz
+static volatile float mod_amp    = 0.01f; // units (peak)
+static volatile float mod_phase  = 0.0f;  // radians
+
+static volatile bool  out_enable = false; // output relay/enable
+static volatile float measured_I = 0.0f;  // measured current (ADC)
+
+// ======= Hardware API stubs (implement for your board) =======
+
+// Convert engineering units -> DAC volts. If your power amp expects 0–10V for 0–Imax,
+// set your own scaling. Here we assume 1:1 (units == volts) and clip to +/-10.
+static void DAC_SetMagnetVolts(float v)
+{
+    // clip to DAC span
+    if (v > 10.0f) v = 10.0f;
+    if (v < -10.0f) v = -10.0f;
+
+    // TODO: Write to your DAC over SPI (e.g., AD5732R channel B)
+    // Example: AD5732R_Write(CH_MAGNET, v);
+}
+
+static float ADC_ReadMagnetCurrent(void)
+{
+    // TODO: read your shunt/Hall ADC and convert to engineering units
+    // Return echo if you have no sense wired yet:
+    return b_out;
+}
+
+static void MagnetOutputEnable(bool en)
+{
+    out_enable = en;
+    // TODO: control your output relay/enable GPIO here
+}
+
+// ======= Helpers =======
+static float clampf(float x, float lo, float hi)
+{
+    if (x < lo) return lo;
+    if (x > hi) return hi;
+    return x;
+}
+
+// ======= Control ISR (call @ CTRL_TICK_HZ) =======
+void Magnet_CtrlTickISR(void)
+{
+    // ramp engine: move b_out toward b_target at limited slew rate
+    float step = ramp_rate / CTRL_TICK_HZ;  // units per tick
+    if (!ramp_enable) step = B_MAX;         // immediate (hold) if ramp disabled
+
+    float diff = b_target - b_out;
+    if (fabsf(diff) <= step) {
+        b_out = b_target;
+    } else {
+        b_out += (diff > 0 ? step : -step);
+    }
+
+    // LF modulation
+    float b_cmd = b_out;
+    if (mod_enable) {
+        mod_phase += TWO_PI * (mod_freq / CTRL_TICK_HZ);
+        if (mod_phase > TWO_PI) mod_phase -= TWO_PI;
+        b_cmd += mod_amp * sinf(mod_phase);
+    }
+
+    // output enable & limits
+    b_cmd = clampf(b_cmd, -B_MAX, B_MAX);
+    if (!out_enable) b_cmd = 0.0f;
+
+    // drive DAC
+    DAC_SetMagnetVolts(b_cmd);
+
+    // read back measured current
+    measured_I = ADC_ReadMagnetCurrent();
+}
+
+// ======= Command parser =======
+static void uart_write(const char *s); // implement with your UART TX
+
+static void cmd_ok_status(void)
+{
+    char buf[128];
+    // Report *effective* setpoint (b_out) as B, and measured current as I
+    snprintf(buf, sizeof(buf),
+             "OK B=%.6f I=%.6f RAMP=%d MOD=%d EN=%d\r\n",
+             (double)b_out, (double)measured_I,
+             ramp_enable ? 1:0, mod_enable ? 1:0, out_enable ? 1:0);
+    uart_write(buf);
+}
+
+void Magnet_ParseLine(char *line)
+{
+    // trim CRLF
+    char *p = line;
+    while (*p) { if (*p=='\r' || *p=='\n') *p='\0'; p++; }
+    if (line[0]=='\0') return;
+
+    // --- BM <value>
+    if (strncmp(line, "BM ", 3)==0) {
+        float v = atof(line+3);
+        if (!isfinite(v)) { uart_write("ERR BAD\n"); return; }
+        v = clampf(v, -B_MAX, B_MAX);
+        b_target = v;
+        uart_write("OK\n");
+        return;
+    }
+
+    // --- BR <rate>
+    if (strncmp(line, "BR ", 3)==0) {
+        float r = atof(line+3);
+        if (!isfinite(r) || r<=0) { uart_write("ERR BAD\n"); return; }
+        ramp_rate = clampf(r, 0.001f, SLEW_MAX);
+        uart_write("OK\n");
+        return;
+    }
+
+    // --- BS START / BS STOP
+    if (strcmp(line, "BS START")==0) { ramp_enable = true;  uart_write("OK\n"); return; }
+    if (strcmp(line, "BS STOP")==0)  { ramp_enable = false; uart_write("OK\n"); return; }
+
+    // --- BF <freq> <amp>  / BF OFF
+    if (strncmp(line, "BF ", 3)==0) {
+        if (strcmp(line+3, "OFF")==0) {
+            mod_enable = false;
+            uart_write("OK\n"); return;
+        } else {
+            float f=0, a=0;
+            if (sscanf(line+3, "%f %f", &f, &a)==2) {
+                if (f<=0 || f>MOD_FREQ_MAX || a<0 || a>MOD_AMP_MAX) {
+                    uart_write("ERR BAD\n"); return;
+                }
+                mod_freq = f; mod_amp = a; mod_phase = 0.0f;
+                mod_enable = true;
+                uart_write("OK\n"); return;
+            }
+        }
+        uart_write("ERR BAD\n"); return;
+    }
+
+    // --- BO 0/1  (output enable)
+    if (strncmp(line, "BO ", 3)==0) {
+        int en = atoi(line+3);
+        MagnetOutputEnable(en ? true:false);
+        uart_write("OK\n"); return;
+    }
+
+    // --- ESTOP
+    if (strcmp(line, "ESTOP")==0) {
+        MagnetOutputEnable(false);
+        b_target = 0.0f; b_out = 0.0f; mod_enable = false; ramp_enable = false;
+        uart_write("OK\n"); return;
+    }
+
+    // --- Q?
+    if (strcmp(line, "Q?")==0) { cmd_ok_status(); return; }
+
+    uart_write("ERR ?\n");
+}
+
+// ======= UART glue (example) =======
+// Call this from your existing UART RX line assembly when a full line received.
+
+static void uart_write(const char *s)
+{
+    // TODO: replace with your UART TX
+    // e.g., while(*s) UART_TX(*s++);
+}
